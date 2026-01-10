@@ -140,10 +140,13 @@ dependencies = [
 name = "ai-forensic-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "io",
  "memmap2",
  "pyo3",
  "rayon",
+ "serde",
+ "serde_json",
  "slint",
  "zstd",
 ]
