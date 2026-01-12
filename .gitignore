@@ -1,0 +1,7 @@
+target/
+**/target/
+**/*.rs.bk
+*.db
+*.img
+**/shared/
+**/__pycache__/

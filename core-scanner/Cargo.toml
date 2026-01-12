@@ -1,0 +1,19 @@
+[package]
+name = "ai-forensic-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Für schnelle parallele Verarbeitung
+rayon = "1.8"
+# Für die Kompression der Funde
+zstd = "0.13"
+# Für die spätere Python-Anbindung
+pyo3 = { version = "0.23", features = ["extension-module"] }
+# Für die GUI (später)
+slint = "1.3"
+memmap2 = "0.9.9"
+io = "0.0.2"
+serde = "1.0.228"
+serde_json = "1.0.149"
+base64 = "0.22.1"
