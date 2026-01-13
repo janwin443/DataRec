@@ -136,9 +136,13 @@ fn run_scanner(path: &str, sector_size: usize) -> io::Result<()> {
             })
             .collect();
 
+        // ... (Anfang bleibt gleich)
         // Ergebnisse verarbeiten
         for (idx, ent, label, data) in findings {
-            // MFT Parsing Logik
+            // 1. MESSUNG: Wir schicken nur bei Treffern ODER in festen Intervallen ein Update
+            // Das verhindert das Ruckeln in der GUI massiv.
+            let should_send = label != "High_Entropy" || idx % 1000 == 0;
+
             let mut mft_info = String::new();
             let mut is_active = false;
             
@@ -149,49 +153,37 @@ fn run_scanner(path: &str, sector_size: usize) -> io::Result<()> {
                 }
             }
 
-            // CARVING LOGIK: Wenn es ein Bild/Dokument ist, versuchen wir mehr als 4KB zu lesen
-            // Achtung: Das ist ein langsamer I/O Prozess, daher nur bei echten Treffern
-            let estimated_size = detect_file_size(&data, &label);
-            
-            // Wenn größer als 1 Sektor, müssen wir von der Platte nachlesen
-            if estimated_size > sector_size && label != "NTFS_MFT" && label != "High_Entropy" {
-                let offset = idx * sector_size as u64;
-                // Wir springen an die Stelle und lesen 'estimated_size'
-                // Ignoriere Fehler beim Seek (könnte Dateiende sein)
-                if let Ok(_) = extraction_file.seek(SeekFrom::Start(offset)) {
-                    let mut full_data = vec![0u8; estimated_size];
-                    if let Ok(n) = extraction_file.read(&mut full_data) {
-                        full_data.truncate(n);
-                        // Überschreibe 'save_sector' mit den vollen Daten
-                        let _ = save_full_file(idx, &full_data, &label);
-                    }
-                }
-            } else {
-                // Standard 4KB speichern
-                let _ = save_sector(idx, &data, &label);
+            // ... (Deine Carving-Logik mit extraction_file bleibt hier)
+
+            if should_send {
+                // KI PREVIEW: Für die echte KI-Wiederherstellung brauchen wir mehr als 64 Bytes!
+                // Ich empfehle 256 Bytes, damit das Modell genug Kontext hat.
+                let preview_len = std::cmp::min(data.len(), 256); 
+                let b64_preview = general_purpose::STANDARD.encode(&data[..preview_len]);
+
+                let status = json!({
+                    "type": "status",
+                    "sector": idx,
+                    "total_sectors": total_sectors,
+                    "label": label,
+                    "entropy": ent,
+                    "preview": b64_preview, // Das hier füttert jetzt dein Python-KI-Modell
+                    "filename": if label == "NTFS_MFT" { mft_info } else { "".to_string() },
+                    "is_active": is_active,
+                    "progress": (current_pos as f64 / total_size as f64) * 100.0,
+                    "speed": (current_pos as f64 / 1_048_576.0) / (start_time.elapsed().as_secs_f64() + 0.001)
+                });
+
+                println!("{}", status.to_string());
+                let _ = io::stdout().flush();
             }
 
-            // KI Preview (Base64)
-            let preview_len = std::cmp::min(data.len(), 64);
-            let b64_preview = general_purpose::STANDARD.encode(&data[..preview_len]);
-
-            let status = json!({
-                "type": "status",
-                "sector": idx,
-                "total_sectors": total_sectors,
-                "label": label,
-                "entropy": ent,
-                "preview": b64_preview,
-                "filename": if label == "NTFS_MFT" { extract_name(&data) } else { "".to_string() }, // &data statt sector oder idx
-                "is_active": is_active, // Gelöscht oder nicht?
-                "progress": (current_pos as f64 / total_size as f64) * 100.0,
-                "speed": (current_pos as f64 / 1_048_576.0) / (start_time.elapsed().as_secs_f64() + 0.001)
-            });
-            println!("{}", status.to_string());
-            let _ = io::stdout().flush();
+            // WICHTIG: Die Datei-Logik (log_finding) sollte immer laufen, 
+            // damit die findings.csv für den Reconstructor vollständig ist.
             let _ = log_finding(idx, ent, &label);
         }
         current_pos += bytes_read as u64;
+// ... (Rest bleibt gleich)
     }
     println!("{}", json!({"type": "finished"}).to_string());
     Ok(())

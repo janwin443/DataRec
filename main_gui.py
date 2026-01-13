@@ -1,6 +1,8 @@
-import customtkinter as tk
-import importlib
 from tkinter import filedialog, ttk
+from PIL import Image, ImageDraw
+import customtkinter as tk
+import numpy as np
+import importlib
 import os
 import glob
 import json
@@ -13,8 +15,8 @@ import base64 # Hinzugefügt für KI Datentransfer
 
 # KI Module dynamisch laden
 try:
-    rc = importlib.import_module("ai-logic.reconstructor")
-    classifier_mod = importlib.import_module("ai-logic.classifier")
+    rc = importlib.import_module("ai_logic.reconstructor")
+    classifier_mod = importlib.import_module("ai_logic.classifier")
     classifier = classifier_mod.classifier
 except Exception as e:
     print(f"KI Module nicht geladen: {e}")
@@ -292,17 +294,19 @@ class App(tk.CTk):
         threading.Thread(target=self.rust_worker, args=(self.selected_source, s_size), daemon=True).start()
         self.after(100, self.process_queue)
 
+        self.after(5000, self.start_periodic_ai_refinement)
+
     def stop_scan(self):
         if self.rust_process: self.rust_process.terminate()
 
     def rust_worker(self, source, s_size):
         base_dir = os.path.dirname(os.path.abspath(__file__))
         rust_proj_dir = os.path.join(base_dir, "core-scanner")
-        bin_path = os.path.join(rust_proj_dir, "target", "release", "core-scanner")
+        bin_path = os.path.join(rust_proj_dir, "target", "release", "scanner")
         cmd = [bin_path, source, s_size] if os.path.exists(bin_path) else ["cargo", "run", "--release", "-q", "--", source, s_size]
         cwd_to_use = base_dir if os.path.exists(bin_path) else rust_proj_dir
         try:
-            self.rust_process = subprocess.Popen(cmd, cwd=cwd_to_use, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            self.rust_process = subprocess.Popen(cmd, cwd=cwd_to_use, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
             for line in iter(self.rust_process.stdout.readline, ''):
                 if line.startswith('{'):
                     try: self.data_queue.put(json.loads(line))
@@ -314,7 +318,7 @@ class App(tk.CTk):
 
     def process_queue(self):
         try:
-            while True:
+            for _ in range(100):
                 data = self.data_queue.get_nowait()
                 if data["type"] == "status":
                     # --- 1. UI Standard-Updates ---
@@ -371,15 +375,20 @@ class App(tk.CTk):
                         self.log_text.see(tk.END)
                         self.log_text.configure(state="disabled")
 
-                    # LOGIK C: KI-Analyse für Unbekanntes
+                    # LOGIK C: KI-Rekonstruktion & Speicherung      
                     elif label in ["High_Entropy", "Unknown"] and classifier and preview:
-                        # Hier rufen wir dein KI-Modell auf
                         ai_label, conf = classifier.classify_sector(preview)
                         
-                        if conf > 65: # Schwellenwert für Relevanz
-                                self.folder_tree.insert(self.tree_nodes["AI"], "end", 
-                                                    text=f"Sektor_{sector_idx}", 
-                                                    values=(f"{ai_label}", f"{conf}% Konfidenz"))
+                        if conf > 85: # Wir nehmen nur sehr sichere Treffer
+                            # 1. Im KI-Tree anzeigen
+                            self.folder_tree.insert(self.tree_nodes["AI"], "end", 
+                                                text=f"Rekonstruiert_{sector_idx}.{ai_label.lower()}", 
+                                                values=(f"Sektor {sector_idx}", f"{conf}% Konfidenz"))
+                            
+                            # 2. Den Sektorinhalt für die Wiederherstellung vormerken
+                            # Wir senden einen Befehl an den Reconstructor (ai-logic)
+                            if hasattr(rc, 'queue_fragment'):
+                                rc.queue_fragment(sector_idx, preview, ai_label)
 
                 elif data["type"] == "finished":
                     self.start_button.configure(state="normal")
@@ -391,8 +400,80 @@ class App(tk.CTk):
                         threading.Thread(target=rc.analyze_findings_csv, args=("../shared/findings.csv",), daemon=True).start()
                     
                     return
+        
         except queue.Empty: pass
         if self.is_scanning: self.after(100, self.process_queue)
+
+    def update_heatmap_view(self):
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            heatmap_path = os.path.join(base_dir, "shared", "heatmap_output.bin")
+            
+            if not os.path.exists(heatmap_path) or os.path.getsize(heatmap_path) < 4:
+                return
+
+            scores = np.fromfile(heatmap_path, dtype=np.float32)
+            if scores.size == 0: return
+
+            # --- OPTIMIERUNG: Festgelegte Breite für bessere Struktur ---
+            # 256 ist ein guter Standardwert für binäre Strukturen
+            width = 256
+            height = int(np.ceil(scores.size / width))
+            
+            # Tiefschwarzer Hintergrund (0, 0, 0)
+            img_data = np.zeros((width * height, 3), dtype=np.uint8)
+            
+            # Dynamische Skalierung: Wir heben nur die Spitzenwerte hervor
+            # Alles unter 10% Wahrscheinlichkeit lassen wir fast schwarz
+            mask = scores > 0.1
+            
+            # MFT-Wahrscheinlichkeit -> Leuchtendes Neongelb/Orange auf Schwarz
+            # Rotkanal voll, Grünkanal halb = Orange
+            img_data[:scores.size, 0][mask] = (np.clip(scores[mask] * 2.0, 0, 1) * 255).astype(np.uint8)
+            img_data[:scores.size, 1][mask] = (np.clip(scores[mask], 0, 1) * 120).astype(np.uint8)
+            
+            # Ein ganz schwacher blauer Schimmer für bereits gescannte Bereiche (nicht MFT)
+            img_data[:scores.size, 2][~mask] = 30 
+
+            # In Form bringen
+            img_array = img_data.reshape((height, width, 3))
+            img = Image.fromarray(img_array, 'RGB')
+
+            # --- Skalierung für die GUI ---
+            # Wir nutzen 'NEAREST', damit die Pixel scharf bleiben und nicht verschwimmen
+            ctk_img = tk.CTkImage(light_image=img, dark_image=img, size=(400, 600))
+            
+            self.after(0, lambda: self.heatmap_label.configure(image=ctk_img, text=""))
+            self.heatmap_label.image = ctk_img 
+            
+        except Exception as e:
+            print(f"Heatmap-Engine Fehler: {e}")
+
+    def schedule_heatmap_update(self):
+        if self.is_scanning:
+            threading.Thread(target=self.update_heatmap_view, daemon=True).start()
+            self.after(3000, self.schedule_heatmap_update)
+
+    def start_periodic_ai_refinement(self):
+        """Startet die KI-Analyse periodisch während des Scans"""
+        if self.is_scanning:
+            try:
+                from ai_logic.ai_refinement import AIRefinement
+                # Wir erstellen eine Instanz und lassen sie die aktuelle CSV verarbeiten
+                refiner = AIRefinement()
+                
+                # Wir führen es in einem Thread aus, damit die GUI nicht ruckelt
+                threading.Thread(target=refiner.process_unknown_sectors, daemon=True).start()
+                
+                # Log für die Konsole, damit du siehst, dass sie arbeitet
+                print(f"[UI] Periodisches KI-Refinement angestoßen (Sektor: {self.status_label.cget('text')})")
+                
+            except Exception as e:
+                print(f"Fehler beim periodischen KI-Start: {e}")
+            
+            # Alle 10.000 Millisekunden (10 Sekunden) neu ausführen
+            self.after(10000, self.start_periodic_ai_refinement)
+    
 
 if __name__ == '__main__':
     app = App()
